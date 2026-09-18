@@ -1,0 +1,204 @@
+"""User-contributed protocol for Huawei product A002 (美的智能空调系列).
+
+设备类型: 智能空调 (Air Conditioner), 型号 Midea Air Conditioner (prodId: A002, deviceTypeId: 012)
+制造商: 美的 (Midea)
+Profile: https://smarthome-drcn.dbankcdn.com/device/guide/A002/A002.json
+
+核心服务:
+   switch.on            bool RW (0=关, 1=开)
+   mode.mode            enum RW (1=自动, 2=制冷, 3=制热, 4=送风, 5=抽湿)
+   temperature.current  int  R  (当前室温 ℃)
+   temperature.target   int  RW (目标温度 ℃, 16-30)
+   fan.direction        enum RW (1=固定, 2=左右扫风, 3=上下扫风, 4=左右+上下)
+   fan.speed            int  RW (风速 1-100)
+   fan.mode             enum RW (0=手动风, 1=自动风)
+   faultDetection.status bool R (0=正常, 1=异常)
+   netInfo.intensity    enum R  (Wi-Fi信号)
+
+本适配器暴露:
+   1. climate 实体: 空调开关 / 模式 / 目标温度 / 当前室温 / 摆风模式
+   2. binary_sensor 实体: 故障告警 (device_class: problem)
+   3. sensor 实体: Wi-Fi信号强度 (%)
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+from .api import EntitySpec
+from .context import DeviceContext
+
+_TEMP_MIN = 16.0
+_TEMP_MAX = 30.0
+
+_DEV_TO_HVAC = {1: "auto", 2: "cool", 3: "heat", 4: "fan_only", 5: "dry"}
+_HVAC_TO_DEV = {v: k for k, v in _DEV_TO_HVAC.items()}
+
+_DEV_TO_SWING = {1: "off", 2: "horizontal", 3: "vertical", 4: "both"}
+_SWING_TO_DEV = {v: k for k, v in _DEV_TO_SWING.items()}
+
+
+def _as_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(round(float(value.strip())))
+        except (TypeError, ValueError):
+            return None
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return float(int(value))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        if value.casefold() in {"1", "true", "on"}:
+            return True
+        if value.casefold() in {"0", "false", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return None
+
+
+class ProductA002Adapter:
+    """美的智能空调系列 (A002) 适配器。"""
+
+    prod_id = "A002"
+
+    def entities(self, context: DeviceContext) -> tuple[EntitySpec, ...]:
+        if context.profile is None:
+            return ()
+
+        specs: list[EntitySpec] = []
+
+        # 1. Climate 实体
+        if context.has_service("switch") and context.has_service("mode"):
+            def climate_state(device: DeviceContext) -> Mapping[str, Any]:
+                is_on = _as_bool(device.value("switch", "on"))
+                if is_on is False:
+                    hvac_mode = "off"
+                else:
+                    dev_mode = _as_int(device.value("mode", "mode"))
+                    hvac_mode = _DEV_TO_HVAC.get(dev_mode, "auto")
+
+                current_temp = _as_float(device.value("temperature", "current"))
+                target_temp = _as_float(device.value("temperature", "target"))
+
+                dev_swing = _as_int(device.value("fan", "direction"))
+                swing_mode = _DEV_TO_SWING.get(dev_swing, "off")
+
+                return {
+                    "hvac_mode": hvac_mode,
+                    "current_temperature": current_temp,
+                    "target_temperature": target_temp,
+                    "swing_mode": swing_mode,
+                }
+
+            async def set_hvac_mode(device: DeviceContext, data: Mapping[str, Any]) -> None:
+                mode = data.get("hvac_mode")
+                if mode == "off":
+                    await device.async_send_service("switch", {"on": 0})
+                    return
+                dev_val = _HVAC_TO_DEV.get(str(mode))
+                if dev_val is None:
+                    return
+                if not _as_bool(device.value("switch", "on")):
+                    await device.async_send_service("switch", {"on": 1})
+                await device.async_send_service("mode", {"mode": dev_val})
+
+            async def set_temperature(device: DeviceContext, data: Mapping[str, Any]) -> None:
+                temp = data.get("temperature")
+                if temp is None:
+                    return
+                val = int(round(max(_TEMP_MIN, min(_TEMP_MAX, float(temp)))))
+                await device.async_send_service("temperature", {"target": val})
+
+            async def set_swing_mode(device: DeviceContext, data: Mapping[str, Any]) -> None:
+                swing = data.get("swing_mode")
+                val = _SWING_TO_DEV.get(str(swing))
+                if val is not None:
+                    await device.async_send_service("fan", {"direction": val})
+
+            async def turn_on(device: DeviceContext, _data: Mapping[str, Any]) -> None:
+                await device.async_send_service("switch", {"on": 1})
+
+            async def turn_off(device: DeviceContext, _data: Mapping[str, Any]) -> None:
+                await device.async_send_service("switch", {"on": 0})
+
+            specs.append(
+                EntitySpec(
+                    platform="climate",
+                    key="ac",
+                    name="空调",
+                    state=climate_state,
+                    metadata={
+                        "hvac_modes": ["off", "auto", "cool", "heat", "fan_only", "dry"],
+                        "swing_modes": ["off", "horizontal", "vertical", "both"],
+                        "min_temp": _TEMP_MIN,
+                        "max_temp": _TEMP_MAX,
+                        "temp_step": 1.0,
+                    },
+                    actions={
+                        "set_hvac_mode": set_hvac_mode,
+                        "set_temperature": set_temperature,
+                        "set_swing_mode": set_swing_mode,
+                        "turn_on": turn_on,
+                        "turn_off": turn_off,
+                    },
+                )
+            )
+
+        # 2. 故障诊断 (binary_sensor)
+        if context.has_service("faultDetection"):
+            def fault_state(device: DeviceContext) -> Mapping[str, Any]:
+                return {"is_on": _as_bool(device.value("faultDetection", "status")) is True}
+
+            specs.append(
+                EntitySpec(
+                    platform="binary_sensor",
+                    key="fault",
+                    name="运行异常告警",
+                    state=fault_state,
+                    metadata={"device_class": "problem"},
+                )
+            )
+
+        # 3. Wi-Fi 信号 (sensor)
+        if context.has_service("netInfo"):
+            def wifi_state(device: DeviceContext) -> Mapping[str, Any]:
+                intensity = _as_int(device.value("netInfo", "intensity"))
+                return {"native_value": intensity if intensity is not None and 0 <= intensity <= 100 else None}
+
+            specs.append(
+                EntitySpec(
+                    platform="sensor",
+                    key="wifi_signal",
+                    name="Wi-Fi信号强度",
+                    state=wifi_state,
+                    metadata={"unit": "%", "state_class": "measurement", "icon": "mdi:wifi"},
+                )
+            )
+
+        return tuple(specs)
+
+
+ADAPTER = ProductA002Adapter()
